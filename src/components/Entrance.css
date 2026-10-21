@@ -1,0 +1,220 @@
+.atelier-gate {
+  --gate-gold: #cdb67d;
+  --gate-ivory: #f3ead7;
+  position: relative;
+  display: grid;
+  min-height: 100svh;
+  place-items: center;
+  overflow: hidden;
+  isolation: isolate;
+  padding: clamp(54px, 9vh, 100px) 28px;
+  color: var(--gate-ivory);
+  text-align: center;
+  background-color: #694a35;
+  background-image:
+    radial-gradient(ellipse at 50% 38%, rgba(151, 111, 72, .26), transparent 52%),
+    repeating-linear-gradient(0deg, rgba(255, 241, 215, .018) 0 1px, transparent 1px 4px),
+    repeating-linear-gradient(90deg, rgba(38, 23, 14, .025) 0 1px, transparent 1px 5px);
+}
+
+.atelier-gate__texture,
+.atelier-gate__frame,
+.atelier-gate__floral {
+  position: absolute;
+  pointer-events: none;
+}
+
+.atelier-gate__texture {
+  z-index: -1;
+  inset: 0;
+  opacity: .28;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.88' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.16'/%3E%3C/svg%3E");
+}
+
+.atelier-gate__frame {
+  z-index: 2;
+  inset: 17px;
+  border: 1px solid rgba(205, 182, 125, .68);
+}
+
+.atelier-gate__frame::before {
+  position: absolute;
+  content: "";
+  inset: 6px;
+  border: 1px solid rgba(205, 182, 125, .22);
+}
+
+.atelier-gate__floral {
+  z-index: -1;
+  bottom: -3.5%;
+  width: clamp(190px, 29vw, 440px);
+  opacity: .74;
+  filter: drop-shadow(0 1px 1px rgba(34, 21, 13, .18));
+}
+
+.atelier-gate__floral--left {
+  left: -1.5%;
+}
+
+.atelier-gate__floral--right {
+  right: -1.5%;
+  transform: scaleX(-1);
+}
+
+.atelier-gate__content {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 760px);
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+}
+
+.atelier-gate__established,
+.atelier-gate__disciplines,
+.atelier-gate__atelier {
+  color: var(--gate-gold);
+  font-size: 10px;
+  letter-spacing: .28em;
+  line-height: 1.7;
+}
+
+.atelier-gate__established {
+  margin: 0 0 29px;
+}
+
+.atelier-gate__rule {
+  position: relative;
+  width: 116px;
+  height: 1px;
+  margin: 0 0 22px;
+  background: linear-gradient(90deg, transparent, var(--gate-gold), transparent);
+}
+
+.atelier-gate__rule i {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--gate-gold);
+  background: #75543c;
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.atelier-gate h1 {
+  margin: 0;
+  color: #f6eddc;
+  font: 400 clamp(48px, 8.5vw, 106px)/1.05 var(--serif);
+  letter-spacing: .095em;
+  text-indent: .095em;
+  text-shadow: 0 2px 18px rgba(37, 22, 13, .2);
+}
+
+.atelier-gate__disciplines {
+  margin: 19px 0 0;
+  letter-spacing: .32em;
+  text-indent: .32em;
+}
+
+.atelier-gate__disciplines span {
+  padding: 0 .3em;
+  color: #e4d2a8;
+}
+
+.atelier-gate__tagline {
+  margin: clamp(32px, 6vh, 58px) 0 34px;
+  color: #f0e5d1;
+  font: italic 400 clamp(18px, 2.4vw, 24px)/1.5 var(--serif);
+}
+
+.atelier-gate__enter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  min-width: 250px;
+  padding: 17px 23px;
+  border: 1px solid var(--gate-gold);
+  color: #f7efdf;
+  background: rgba(48, 31, 20, .15);
+  font-size: 10px;
+  letter-spacing: .2em;
+  text-decoration: none;
+  transition: background-color .22s ease, color .22s ease, border-color .22s ease;
+}
+
+.atelier-gate__enter span {
+  color: var(--gate-gold);
+  font-size: 16px;
+  transition: transform .22s ease;
+}
+
+.atelier-gate__enter:hover {
+  border-color: #e1cf9f;
+  color: #382619;
+  background: #d4bf8b;
+}
+
+.atelier-gate__enter:hover span {
+  color: #382619;
+  transform: translateX(3px);
+}
+
+.atelier-gate__atelier {
+  margin: clamp(51px, 9vh, 82px) 0 0;
+  font-size: 8px;
+  letter-spacing: .31em;
+}
+
+@media (max-width: 640px) {
+  .atelier-gate {
+    min-height: 100svh;
+    padding: 70px 26px 106px;
+  }
+
+  .atelier-gate__frame {
+    inset: 11px;
+  }
+
+  .atelier-gate__frame::before {
+    inset: 5px;
+  }
+
+  .atelier-gate__established {
+    margin-bottom: 23px;
+  }
+
+  .atelier-gate h1 {
+    font-size: clamp(38px, 11vw, 58px);
+    letter-spacing: .065em;
+    text-indent: .065em;
+  }
+
+  .atelier-gate__disciplines {
+    font-size: 8px;
+    letter-spacing: .2em;
+    text-indent: .2em;
+  }
+
+  .atelier-gate__floral {
+    bottom: -1%;
+    width: clamp(160px, 48vw, 245px);
+    opacity: .57;
+  }
+
+  .atelier-gate__floral--left {
+    left: -17%;
+  }
+
+  .atelier-gate__floral--right {
+    right: -17%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .atelier-gate__enter,
+  .atelier-gate__enter span {
+    transition: none;
+  }
+}

@@ -5,6 +5,16 @@
 
 const BASE = "http://localhost:3000";
 
+// Keep network failures understandable in the storefront instead of exposing
+// the browser's generic "Failed to fetch" message.
+async function fetchApi(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch {
+    throw new Error("The MAISON MIRO server could not be reached. Check that the backend is running, then try again.");
+  }
+}
+
 /** Returns the JWT stored in sessionStorage (if any). */
 export function getToken() {
   return sessionStorage.getItem("mm_token") || "";
@@ -43,12 +53,12 @@ function jsonHeaders() {
 // ── Public ──────────────────────────────────────────────────────────────────
 
 export async function fetchPaintings() {
-  const res = await fetch(`${BASE}/api/paintings`);
+  const res = await fetchApi(`${BASE}/api/paintings`);
   return handleResponse(res); // { success, paintings }
 }
 
 export async function fetchPainting(id) {
-  const res = await fetch(`${BASE}/api/paintings/${id}`);
+  const res = await fetchApi(`${BASE}/api/paintings/${encodeURIComponent(id)}`);
   return handleResponse(res); // { success, painting }
 }
 
@@ -124,6 +134,38 @@ export async function cancelOrder(orderId) {
   return handleResponse(res); // { success, message }
 }
 
+// ── Customer: artwork requests ─────────────────────────────────────────────
+
+export async function createPaintingRequest(paintingId) {
+  const res = await fetch(`${BASE}/api/painting-requests`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ painting_id: paintingId }),
+  });
+  return handleResponse(res);
+}
+
+export async function fetchMyPaintingRequests() {
+  const res = await fetch(`${BASE}/api/painting-requests/my`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+
+export async function cancelPaintingRequest(requestId) {
+  const res = await fetch(`${BASE}/api/painting-requests/${requestId}/cancel`, {
+    method: "PATCH",
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function validatePaintingRequestForCart(requestId) {
+  const res = await fetch(`${BASE}/api/painting-requests/${requestId}/cart-eligibility`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
 // ── Customer: wall bookings ─────────────────────────────────────────────────
 
 export async function createWallBooking(payload) {
@@ -157,6 +199,14 @@ export async function cancelWallBooking(bookingId) {
   return handleResponse(res); // { success, message }
 }
 
+export async function validateWallBookingForCart(bookingId) {
+  const res = await fetch(`${BASE}/api/wall-bookings/${bookingId}/cart-eligibility`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
 // ── Customer: pottery requests ──────────────────────────────────────────────
 
 export async function createPotteryRequest(payload) {
@@ -186,13 +236,53 @@ export async function updatePotteryRequest(requestId, payload) {
   return handleResponse(res); // { success, message | request }
 }
 
+export async function validatePotteryRequestForCart(requestId) {
+  const res = await fetch(`${BASE}/api/pottery-requests/${requestId}/cart-eligibility`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
 // ── Studio admin ────────────────────────────────────────────────────────────
+
+export async function createAdminPainting(painting) {
+  const res = await fetchApi(`${BASE}/api/admin/paintings`, {
+    method: "POST",
+    headers: jsonHeaders(),
+    body: JSON.stringify(painting),
+  });
+  return handleResponse(res);
+}
+
+export async function updateAdminPainting(paintingId, painting) {
+  const res = await fetchApi(`${BASE}/api/admin/paintings/${encodeURIComponent(paintingId)}`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify(painting),
+  });
+  return handleResponse(res);
+}
 
 export async function fetchAdminOrders() {
   const res = await fetch(`${BASE}/api/admin/orders`, {
     headers: authHeaders(),
   });
   return handleResponse(res); // { success, orders }
+}
+
+export async function fetchAdminPaintingRequests() {
+  const res = await fetch(`${BASE}/api/admin/painting-requests`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+
+export async function updateAdminPaintingRequest(requestId, status) {
+  const res = await fetch(`${BASE}/api/admin/painting-requests/${requestId}`, {
+    method: "PATCH",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ status }),
+  });
+  return handleResponse(res);
 }
 
 export async function fetchAdminWallBookings() {

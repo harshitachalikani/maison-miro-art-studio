@@ -8,10 +8,15 @@ export function CartProvider({ children }) {
   const addToCart = useCallback((item) => {
     setItems((current) => {
       if (item.type === "pottery") {
-        const existing = current.find((line) => line.type === "pottery" && line.id === item.id && line.details.glaze_id === item.details.glaze_id && line.details.needed_by === item.details.needed_by);
-        if (existing && existing.quantity + item.quantity <= 12) return current.map((line) => line === existing ? { ...line, quantity: line.quantity + item.quantity } : line);
+        if (!item.request_id) return current;
+        if (current.some((line) => line.type === "pottery" && line.request_id === item.request_id)) return current;
       } else if (item.type === "painting" || !item.type) {
+        if (!item.request_id) return current;
         if (current.some((line) => line.type === "painting" && line.id === item.id)) return current;
+      } else if (item.type === "mural" && item.request_id) {
+        if (current.some((line) => line.type === "mural" && line.request_id === item.request_id)) return current;
+      } else if (item.type === "mural") {
+        return current;
       }
       const type = item.type || "painting";
       const normalized = type === "painting"

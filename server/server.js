@@ -1,13 +1,16 @@
 
 require("dotenv").config();
+/* global __dirname */
 
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const { randomUUID } = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const crypto = require("node:crypto");
 const { potteryPrice, potteryEstimate, validWallSize } = require("./pricing");
 const { validateDeliveryAddress, normalizeDeliveryAddress, calculateLineTotal, calculateMuralTotal, sumCheckoutLines } = require("./checkout");
 
@@ -32,7 +35,7 @@ function authenticateToken(req, res, next) {
   try {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
-  } catch (error) {
+  } catch {
     return res.status(401).json({
       success: false,
       message: "Invalid or expired token"
@@ -69,6 +72,16 @@ async function configuredWallRate() {
   return result.rows.length ? Number(result.rows[0].setting_value) : null;
 }
 
+function workflowFailureMessage(error, subject) {
+  if (["ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT"].includes(error.code)) {
+    return `The database is unavailable, so ${subject} could not be saved or loaded. Please try again after the database connection is restored.`;
+  }
+  if (["42P01", "42703"].includes(error.code)) {
+    return `${subject} database setup is incomplete. Apply 001_unified_checkout.sql followed by 002_request_approvals.sql.`;
+  }
+  return null;
+}
+
 
 // ─── Date helpers ──────────────────────────────────────────────────────────────
 
@@ -91,6 +104,20 @@ function isValidISODate(value) {
   return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)
     && !Number.isNaN(new Date(`${value}T00:00:00Z`).getTime())
     && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+}
+
+// PostgreSQL DATE values are parsed by node-postgres as Date objects. Convert
+// them through UTC ISO formatting so timezone and locale strings cannot shift
+// the calendar day during comparisons with YYYY-MM-DD inputs.
+function dateOnlyISO(value) {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? "" : value.toISOString().slice(0, 10);
+  }
+  if (typeof value === "string") {
+    const match = value.match(/^(\d{4}-\d{2}-\d{2})(?:$|T)/);
+    return match ? match[1] : "";
+  }
+  return "";
 }
 
 /** Returns the number of whole days from `from` to `to` (both YYYY-MM-DD strings). */
@@ -145,10 +172,14 @@ app.get("/api/paintings", async (req, res) => {
     });
   } catch (error) {
     console.error("Could not fetch paintings:", error.message);
-
-    res.status(500).json({
+    const setupMessage = error.code === "ENOTFOUND" || error.code === "ECONNREFUSED" || error.code === "ETIMEDOUT"
+      ? "The artwork catalogue is temporarily unavailable because the database connection could not be reached. Please try again later."
+      : error.code === "42P01"
+        ? "The artwork catalogue table is not available in the configured database. Check the backend database configuration."
+        : null;
+    res.status(setupMessage ? 503 : 500).json({
       success: false,
-      message: "Could not fetch paintings"
+      message: setupMessage || "Could not fetch paintings"
     });
   }
 });
@@ -171,9 +202,109 @@ app.get("/api/paintings/:id", async (req, res) => {
     res.json({ success: true, painting: result.rows[0] });
   } catch (error) {
     console.error("Could not fetch painting:", error.message);
-    res.status(500).json({
+    const setupMessage = error.code === "ENOTFOUND" || error.code === "ECONNREFUSED" || error.code === "ETIMEDOUT"
+      ? "This artwork is temporarily unavailable because the database connection could not be reached. Please try again later."
+      : error.code === "42P01"
+        ? "The artwork catalogue table is not available in the configured database. Check the backend database configuration."
+        : null;
+    res.status(setupMessage ? 503 : 500).json({
       success: false,
-      message: "Could not fetch painting"
+      message: setupMessage || "Could not fetch painting"
+    });
+  }
+});
+
+function normalizePaintingImageUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const imageUrl = value.trim();
+  if (/^https?:\/\//i.test(imageUrl)) {
+    try {
+      const parsed = new URL(imageUrl);
+      return ["http:", "https:"].includes(parsed.protocol) ? parsed.toString() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const relativePath = imageUrl.replace(/^\/+/, "");
+  if (!relativePath.startsWith("images/") || relativePath.includes("\\")) return null;
+  const publicImages = path.resolve(__dirname, "../public/images");
+  const filePath = path.resolve(__dirname, "../public", relativePath);
+  if (!filePath.startsWith(`${publicImages}${path.sep}`)) return null;
+  try {
+    return fs.statSync(filePath).isFile() ? relativePath : null;
+  } catch {
+    return null;
+  }
+}
+
+function validatePaintingPayload(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return { error: "Enter valid artwork details" };
+  const title = typeof body.title === "string" ? body.title.trim() : "";
+  const artist = typeof body.artist === "string" ? body.artist.trim() : "";
+  const description = body.description == null ? "" : typeof body.description === "string" ? body.description.trim() : null;
+  const priceIsTyped = typeof body.price === "number" || typeof body.price === "string";
+  const priceInput = typeof body.price === "string" ? body.price.trim() : body.price;
+  const price = !priceIsTyped || priceInput === "" || priceInput == null ? NaN : Number(priceInput);
+  const status = body.status;
+  const imageUrl = normalizePaintingImageUrl(body.image_url);
+
+  if (!title) return { error: "Title is required" };
+  if (!artist) return { error: "Artist is required" };
+  if (description === null) return { error: "Description must be text" };
+  if (!Number.isFinite(price) || price < 0) return { error: "Price must be a valid non-negative number" };
+  if (!imageUrl) return { error: "Enter an existing image under public/images or a valid HTTP(S) image URL" };
+  if (!["available", "sold"].includes(status)) return { error: "Status must be available or sold" };
+  return { painting: { title, artist, description, price, image_url: imageUrl, status } };
+}
+
+/** Studio-only artwork creation; customer catalogue reads the same paintings table. */
+app.post("/api/admin/paintings", authenticateToken, requireRole("studio"), async (req, res) => {
+  const validated = validatePaintingPayload(req.body);
+  if (validated.error) return res.status(400).json({ success: false, message: validated.error });
+  try {
+    const { title, artist, description, price, image_url, status } = validated.painting;
+    const result = await pool.query(
+      `INSERT INTO public.paintings (id, title, artist, description, price, image_url, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, title, artist, description, price, image_url, status`,
+      [`p-${randomUUID()}`, title, artist, description, price, image_url, status]
+    );
+    return res.status(201).json({ success: true, painting: result.rows[0] });
+  } catch (error) {
+    console.error("Studio artwork creation failed:", error.message);
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "An artwork with this ID already exists. Please try again." });
+    const setupMessage = workflowFailureMessage(error, "Artwork catalogue");
+    const invalidData = ["23502", "22P02", "22003", "22001", "23514"].includes(error.code);
+    return res.status(setupMessage ? 503 : invalidData ? 400 : 500).json({
+      success: false,
+      message: setupMessage || (invalidData ? "The artwork details do not match the catalogue requirements" : "Could not add artwork")
+    });
+  }
+});
+
+/** Studio-only artwork editing; public GET routes immediately expose saved changes. */
+app.patch("/api/admin/paintings/:id", authenticateToken, requireRole("studio"), async (req, res) => {
+  const validated = validatePaintingPayload(req.body);
+  if (validated.error) return res.status(400).json({ success: false, message: validated.error });
+  try {
+    const { title, artist, description, price, image_url, status } = validated.painting;
+    const result = await pool.query(
+      `UPDATE public.paintings
+       SET title = $1, artist = $2, description = $3, price = $4, image_url = $5, status = $6
+       WHERE id = $7
+       RETURNING id, title, artist, description, price, image_url, status`,
+      [title, artist, description, price, image_url, status, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Artwork not found" });
+    return res.json({ success: true, painting: result.rows[0] });
+  } catch (error) {
+    console.error("Studio artwork update failed:", error.message);
+    const setupMessage = workflowFailureMessage(error, "Artwork catalogue");
+    const invalidData = ["23502", "22P02", "22003", "22001", "23514"].includes(error.code);
+    return res.status(setupMessage ? 503 : invalidData ? 400 : 500).json({
+      success: false,
+      message: setupMessage || (invalidData ? "The artwork details do not match the catalogue requirements" : "Could not update artwork")
     });
   }
 });
@@ -299,6 +430,186 @@ app.get("/api/auth/me", authenticateToken, (req, res) => {
 
 // ─── Purchase & orders ─────────────────────────────────────────────────────────
 
+// Painting requests are persistent database records. Only the authenticated
+// customer is used as owner; role and approval state are never client supplied.
+app.post("/api/painting-requests", authenticateToken, requireRole("customer"), async (req, res) => {
+  const paintingId = req.body?.painting_id;
+  if (typeof paintingId !== "string" || !paintingId.trim()) {
+    return res.status(400).json({ success: false, message: "Choose an artwork to request" });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const painting = await client.query(
+      "SELECT id, title, artist, price, status, image_url FROM public.paintings WHERE id = $1 FOR UPDATE",
+      [paintingId.trim()]
+    );
+    if (!painting.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Artwork not found" });
+    }
+    if (painting.rows[0].status !== "available") {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, message: "This artwork is no longer available" });
+    }
+    const result = await client.query(
+      `INSERT INTO public.painting_requests (user_id, painting_id, status)
+       VALUES ($1, $2, 'pending') RETURNING *`,
+      [req.user.id, paintingId.trim()]
+    );
+    await client.query("COMMIT");
+    return res.status(201).json({ success: true, request: { ...result.rows[0], painting: painting.rows[0] } });
+  } catch (error) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "You already have an active request for this artwork" });
+    console.error("Artwork request failed:", error.message);
+    const setupMessage = workflowFailureMessage(error, "Artwork requests");
+    return res.status(setupMessage ? 503 : 500).json({ success: false, message: setupMessage || "Could not submit artwork request" });
+  } finally {
+    client?.release();
+  }
+});
+
+app.get("/api/painting-requests/my", authenticateToken, requireRole("customer"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pr.*, p.title, p.artist, p.price, p.image_url
+       FROM public.painting_requests pr
+       JOIN public.paintings p ON p.id = pr.painting_id
+       WHERE pr.user_id = $1 ORDER BY pr.created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ success: true, requests: result.rows });
+  } catch (error) {
+    console.error("Could not fetch artwork requests:", error.message);
+    const setupMessage = workflowFailureMessage(error, "Artwork requests");
+    res.status(setupMessage ? 503 : 500).json({ success: false, message: setupMessage || "Could not fetch artwork requests" });
+  }
+});
+
+app.patch("/api/painting-requests/:id/cancel", authenticateToken, requireRole("customer"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE public.painting_requests
+       SET status = 'cancelled', cancelled_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND status = 'approved'
+         AND order_item_id IS NULL
+       RETURNING *`,
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Request not found or no longer cancellable" });
+    res.json({ success: true, request: result.rows[0] });
+  } catch (error) {
+    if (error.code === "22P02") return res.status(404).json({ success: false, message: "Request not found" });
+    console.error("Artwork request cancellation failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not cancel artwork request" });
+  }
+});
+
+app.post("/api/painting-requests/:id/cart-eligibility", authenticateToken, requireRole("customer"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pr.id AS request_id, pr.status AS request_status, p.id, p.title, p.artist,
+              p.price, p.status AS painting_status, p.image_url
+       FROM public.painting_requests pr JOIN public.paintings p ON p.id = pr.painting_id
+       WHERE pr.id = $1 AND pr.user_id = $2 AND pr.order_item_id IS NULL`,
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Artwork request not found" });
+    const request = result.rows[0];
+    if (request.request_status !== "approved" || request.painting_status !== "available") {
+      return res.status(409).json({ success: false, message: "Only approved requests for available artwork can be added to the bag" });
+    }
+    res.json({ success: true, painting: request });
+  } catch (error) {
+    if (error.code === "22P02") return res.status(404).json({ success: false, message: "Artwork request not found" });
+    console.error("Artwork cart eligibility check failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not verify artwork request" });
+  }
+});
+
+app.get("/api/admin/painting-requests", authenticateToken, requireRole("studio"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pr.*, p.title, p.artist, p.price, p.image_url, u.email AS customer_email
+       FROM public.painting_requests pr
+       JOIN public.paintings p ON p.id = pr.painting_id
+       JOIN public.users u ON u.id = pr.user_id
+       ORDER BY pr.created_at DESC`
+    );
+    res.json({ success: true, requests: result.rows });
+  } catch (error) {
+    console.error("Could not fetch admin artwork requests:", error.message);
+    const setupMessage = workflowFailureMessage(error, "Artwork requests");
+    res.status(setupMessage ? 503 : 500).json({ success: false, message: setupMessage || "Could not fetch artwork requests" });
+  }
+});
+
+app.patch("/api/admin/painting-requests/:id", authenticateToken, requireRole("studio"), async (req, res) => {
+  const { status } = req.body || {};
+  if (!["approved", "declined"].includes(status)) {
+    return res.status(400).json({ success: false, message: "Status must be approved or declined" });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+    const request = await client.query(
+      `SELECT * FROM public.painting_requests WHERE id = $1 AND status = 'pending' FOR UPDATE`,
+      [req.params.id]
+    );
+    if (!request.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Pending artwork request not found" });
+    }
+    if (status === "approved") {
+      const painting = await client.query("SELECT status FROM public.paintings WHERE id = $1 FOR UPDATE", [request.rows[0].painting_id]);
+      if (!painting.rows.length || painting.rows[0].status !== "available") {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ success: false, message: "This artwork is no longer available to approve" });
+      }
+    }
+    const updated = await client.query(
+      "UPDATE public.painting_requests SET status = $1, decided_at = NOW() WHERE id = $2 RETURNING *",
+      [status, request.rows[0].id]
+    );
+    await client.query("COMMIT");
+    res.json({ success: true, request: updated.rows[0] });
+  } catch (error) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "Another request for this artwork has already been approved" });
+    if (error.code === "22P02") return res.status(404).json({ success: false, message: "Artwork request not found" });
+    console.error("Admin artwork request update failed:", error.message);
+    const setupMessage = workflowFailureMessage(error, "Artwork requests");
+    res.status(setupMessage ? 503 : 500).json({ success: false, message: setupMessage || "Could not update artwork request" });
+  } finally {
+    client?.release();
+  }
+});
+
+app.post("/api/wall-bookings/:id/cart-eligibility", authenticateToken, requireRole("customer"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM public.wall_bookings WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Mural request not found" });
+    const booking = result.rows[0];
+    if (booking.status !== "confirmed" || booking.order_item_id) return res.status(409).json({ success: false, message: "Only an approved mural request that has not been checked out can be added to the bag" });
+    const date = dateOnlyISO(booking.booking_date);
+    if (!isValidISODate(date) || date < addDays(todayIST(), 7) || date > addDays(todayIST(), 90)) return res.status(409).json({ success: false, message: "The mural date is no longer within the allowed booking window" });
+    const rate = await configuredWallRate();
+    const size = validWallSize(booking.wall_size_sqft);
+    if (rate === null || !Number.isFinite(rate) || rate < 0 || !size) return res.status(409).json({ success: false, message: "The mural request can no longer be priced" });
+    res.json({ success: true, booking: { ...booking, rate_per_sqft: rate, total_price: calculateMuralTotal(rate, size) } });
+  } catch (error) {
+    if (error.code === "22P02") return res.status(404).json({ success: false, message: "Mural request not found" });
+    console.error("Mural cart eligibility check failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not verify mural request" });
+  }
+});
+
 async function loadOrderDetails(db, orderId) {
   let result;
   try {
@@ -389,8 +700,9 @@ app.post("/api/orders/checkout", authenticateToken, requireRole("customer"), asy
     return res.status(400).json({ success: false, message: "The cart must contain between 1 and 30 items" });
   }
 
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const existing = await client.query(
       "SELECT id FROM public.orders WHERE checkout_key = $1 AND user_id = $2",
       [checkout_key, req.user.id]
@@ -410,40 +722,64 @@ app.post("/api/orders/checkout", authenticateToken, requireRole("customer"), asy
       if (!entry || !["painting", "pottery", "mural"].includes(entry.type)) throw Object.assign(new Error("Cart contains an unsupported item type"), { status: 400 });
       const qty = Number(entry.quantity);
       if (!Number.isInteger(qty) || qty < 1 || qty > 12) throw Object.assign(new Error("Item quantity must be a whole number between 1 and 12"), { status: 400 });
-      const details = entry.details && typeof entry.details === "object" && !Array.isArray(entry.details) ? entry.details : {};
-
       if (entry.type === "painting") {
         if (qty !== 1 || typeof entry.id !== "string" || paintingIds.has(entry.id)) throw Object.assign(new Error("Each original painting may appear only once in the cart"), { status: 400 });
-        paintingIds.add(entry.id);
-        const result = await client.query("SELECT id, title, price, status FROM public.paintings WHERE id = $1 FOR UPDATE", [entry.id]);
+        if (typeof entry.request_id !== "string") throw Object.assign(new Error("An approved artwork request is required"), { status: 400 });
+        const approvedRequest = await client.query(
+          `SELECT id, painting_id, status FROM public.painting_requests
+           WHERE id = $1 AND user_id = $2 AND order_item_id IS NULL FOR UPDATE`,
+          [entry.request_id, req.user.id]
+        );
+        if (!approvedRequest.rows.length || approvedRequest.rows[0].painting_id !== entry.id) throw Object.assign(new Error("Artwork request not found"), { status: 404 });
+        if (approvedRequest.rows[0].status !== "approved") throw Object.assign(new Error("Only approved artwork requests can be checked out"), { status: 409 });
+        const requestId = approvedRequest.rows[0].id;
+        const paintingId = entry.id;
+        paintingIds.add(paintingId);
+        const result = await client.query("SELECT id, title, price, status FROM public.paintings WHERE id = $1 FOR UPDATE", [paintingId]);
         if (!result.rows.length) throw Object.assign(new Error("A painting in the cart could not be found"), { status: 404 });
         const painting = result.rows[0];
         if (painting.status !== "available") throw Object.assign(new Error(`“${painting.title}” is no longer available`), { status: 409 });
         const price = Number(painting.price);
-        lineItems.push({ type: "painting", painting_id: painting.id, name: painting.title, quantity: 1, unit_price: price, line_total: calculateLineTotal(price, 1), status: "placed", details: {} });
+        lineItems.push({ type: "painting", painting_id: painting.id, request_id: requestId, name: painting.title, quantity: 1, unit_price: price, line_total: calculateLineTotal(price, 1), status: "placed", details: {} });
       } else if (entry.type === "pottery") {
-        if (typeof entry.id !== "string" || typeof details.glaze_id !== "string") throw Object.assign(new Error("Choose a pottery item and glaze"), { status: 400 });
-        if (!isValidISODate(details.needed_by) || details.needed_by < addDays(todayIST(), 14)) throw Object.assign(new Error(`Pottery needed-by date must be at least 14 days from today (${addDays(todayIST(), 14)} or later)`), { status: 400 });
-        const [pottery, glaze] = await Promise.all([
-          client.query("SELECT id, name FROM public.pottery_items WHERE id = $1", [entry.id]),
-          client.query("SELECT id, name FROM public.glazes WHERE id = $1", [details.glaze_id])
-        ]);
-        if (!pottery.rows.length || !glaze.rows.length) throw Object.assign(new Error("Choose a valid pottery item and glaze"), { status: 400 });
-        const estimate = potteryEstimate(pottery.rows[0].name, qty);
+        if (typeof entry.request_id !== "string") throw Object.assign(new Error("An accepted pottery request is required"), { status: 400 });
+        const requestResult = await client.query(
+          `SELECT pr.id, pr.item_id, pr.glaze_id, pr.quantity, pr.needed_by, pr.status, pr.order_item_id,
+                  pi.name AS item_name, g.name AS glaze_name
+           FROM public.pottery_requests pr
+           JOIN public.pottery_items pi ON pi.id = pr.item_id
+           JOIN public.glazes g ON g.id = pr.glaze_id
+           WHERE pr.id = $1 AND pr.user_id = $2 FOR UPDATE OF pr`,
+          [entry.request_id, req.user.id]
+        );
+        if (!requestResult.rows.length) throw Object.assign(new Error("Pottery request not found"), { status: 404 });
+        const potteryRequest = requestResult.rows[0];
+        if (potteryRequest.status !== "accepted" || potteryRequest.order_item_id) throw Object.assign(new Error("Only accepted pottery requests that are not already ordered can be checked out"), { status: 409 });
+        if (String(potteryRequest.item_id) !== entry.id || Number(potteryRequest.quantity) !== qty) throw Object.assign(new Error("The pottery bag item no longer matches its accepted request"), { status: 409 });
+        const neededBy = potteryRequest.needed_by instanceof Date
+          ? potteryRequest.needed_by.toISOString().slice(0, 10)
+          : String(potteryRequest.needed_by).slice(0, 10);
+        if (!isValidISODate(neededBy)) throw Object.assign(new Error("The accepted pottery request has an invalid needed-by date"), { status: 409 });
+        const estimate = potteryEstimate(potteryRequest.item_name, qty);
         if (!estimate) throw Object.assign(new Error("This pottery item has no configured checkout price"), { status: 400 });
-        lineItems.push({ type: "pottery", name: pottery.rows[0].name, quantity: qty, unit_price: estimate.price_per_item, line_total: estimate.estimated_total, status: "pending_confirmation", details: { glaze_id: glaze.rows[0].id, glaze_name: glaze.rows[0].name, needed_by: details.needed_by } });
+        lineItems.push({ type: "pottery", pottery_request_id: potteryRequest.id, name: potteryRequest.item_name, quantity: qty, unit_price: estimate.price_per_item, line_total: estimate.estimated_total, status: "pending_confirmation", details: { glaze_id: potteryRequest.glaze_id, glaze_name: potteryRequest.glaze_name, needed_by: neededBy } });
       } else {
-        const size = validWallSize(details.wall_size_sqft);
+        if (qty !== 1 || typeof entry.request_id !== "string") throw Object.assign(new Error("An approved mural request is required"), { status: 400 });
+        const muralRequestResult = await client.query(
+          `SELECT * FROM public.wall_bookings WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+          [entry.request_id, req.user.id]
+        );
+        if (!muralRequestResult.rows.length) throw Object.assign(new Error("Mural request not found"), { status: 404 });
+        const muralRequest = muralRequestResult.rows[0];
+        if (muralRequest.status !== "confirmed" || muralRequest.order_item_id) throw Object.assign(new Error("Only an approved mural request that has not been checked out can be purchased"), { status: 409 });
+        const bookingDate = dateOnlyISO(muralRequest.booking_date);
+        if (!isValidISODate(bookingDate) || bookingDate < addDays(todayIST(), 7) || bookingDate > addDays(todayIST(), 90)) throw Object.assign(new Error("The approved mural date is no longer within the 7–90 day booking window"), { status: 409 });
+        const size = validWallSize(muralRequest.wall_size_sqft);
         if (!size) throw Object.assign(new Error("Mural wall size must be a whole number between 10 and 500 sq ft"), { status: 400 });
-        if (qty !== 1) throw Object.assign(new Error("Mural quantity must be one per project"), { status: 400 });
-        if (!isValidISODate(details.booking_date) || details.booking_date < addDays(todayIST(), 7) || details.booking_date > addDays(todayIST(), 90)) throw Object.assign(new Error("Mural preferred date must be 7 to 90 days from today"), { status: 400 });
         const rate = await configuredWallRate();
         if (rate === null || !Number.isFinite(rate) || rate < 0) throw Object.assign(new Error("Studio mural rate is not configured"), { status: 500 });
         const lineTotal = calculateMuralTotal(rate, size);
-        const serviceAddress = typeof details.service_address === "string" && details.service_address.trim()
-          ? details.service_address.trim()
-          : [savedAddress.house, savedAddress.street, savedAddress.locality, savedAddress.city, savedAddress.state, savedAddress.pin_code].join(", ");
-        lineItems.push({ type: "mural", name: "Wall mural service", quantity: 1, unit_price: rate, line_total: lineTotal, status: "pending_confirmation", details: { wall_size_sqft: size, rate_per_sqft: rate, booking_date: details.booking_date, service_address, estimate: true } });
+        lineItems.push({ type: "mural", mural_request_id: muralRequest.id, name: "Wall mural service", quantity: 1, unit_price: rate, line_total: lineTotal, status: "placed", details: { wall_size_sqft: size, rate_per_sqft: rate, booking_date: bookingDate, service_address: muralRequest.address, estimate: true } });
       }
     }
 
@@ -458,12 +794,37 @@ app.post("/api/orders/checkout", authenticateToken, requireRole("customer"), asy
     const order = orderResult.rows[0];
 
     for (const line of lineItems) {
-      await client.query(
+      const itemResult = await client.query(
         `INSERT INTO public.order_items
            (order_id, item_type, painting_id, item_name, quantity, unit_price, line_total, status, details)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) RETURNING id`,
         [order.id, line.type, line.painting_id || null, line.name, line.quantity, line.unit_price, line.line_total, line.status, JSON.stringify(line.details)]
       );
+      line.id = itemResult.rows[0].id;
+      if (line.request_id) {
+        const updated = await client.query(
+          `UPDATE public.painting_requests SET status = 'purchased', order_item_id = $1
+           WHERE id = $2 AND user_id = $3 AND status = 'approved' AND order_item_id IS NULL`,
+          [line.id, line.request_id, req.user.id]
+        );
+        if (updated.rowCount !== 1) throw Object.assign(new Error("Artwork approval changed before checkout completed"), { status: 409 });
+      }
+      if (line.mural_request_id) {
+        const updated = await client.query(
+          `UPDATE public.wall_bookings SET order_item_id = $1
+           WHERE id = $2 AND user_id = $3 AND status = 'confirmed' AND order_item_id IS NULL`,
+          [line.id, line.mural_request_id, req.user.id]
+        );
+        if (updated.rowCount !== 1) throw Object.assign(new Error("Mural approval changed before checkout completed"), { status: 409 });
+      }
+      if (line.pottery_request_id) {
+        const updated = await client.query(
+          `UPDATE public.pottery_requests SET order_item_id = $1
+           WHERE id = $2 AND user_id = $3 AND status = 'accepted' AND order_item_id IS NULL`,
+          [line.id, line.pottery_request_id, req.user.id]
+        );
+        if (updated.rowCount !== 1) throw Object.assign(new Error("Pottery approval changed before checkout completed"), { status: 409 });
+      }
     }
     for (const paintingId of paintingIds) await client.query("UPDATE public.paintings SET status = 'sold' WHERE id = $1", [paintingId]);
 
@@ -471,88 +832,30 @@ app.post("/api/orders/checkout", authenticateToken, requireRole("customer"), asy
     const responseOrder = { ...order, items: lineItems };
     return res.status(201).json({ success: true, order: responseOrder });
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    if (client) await client.query("ROLLBACK").catch(() => {});
     if (error.code === "23505") {
       const existing = await pool.query("SELECT id FROM public.orders WHERE checkout_key = $1 AND user_id = $2", [checkout_key, req.user.id]).catch(() => ({ rows: [] }));
       if (existing.rows.length) {
         const order = await loadOrderDetails(pool, existing.rows[0].id).catch(() => null);
         if (order) return res.status(200).json({ success: true, order, duplicate: true });
       }
-      return res.status(409).json({ success: false, message: "A painting in this order was just purchased by another customer. Refresh your cart and try again." });
+      return res.status(409).json({ success: false, message: "A request in this order was just used or is no longer available. Refresh your bag and try again." });
     }
     if (error.status) return res.status(error.status).json({ success: false, message: error.message });
     console.error("Checkout failed:", error.message);
-    return res.status(500).json({ success: false, message: "Could not place your order" });
+    const setupMessage = workflowFailureMessage(error, "Checkout");
+    return res.status(setupMessage ? 503 : 500).json({ success: false, message: setupMessage || "Could not place your order" });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
 /**
  * POST /api/paintings/:id/purchase
- * Atomically marks a painting as sold and creates an order.
- * Uses FOR UPDATE row lock + partial unique index to prevent concurrent purchases.
+ * Legacy direct purchase is disabled so artwork cannot bypass Studio approval.
  */
 app.post("/api/paintings/:id/purchase", authenticateToken, requireRole("customer"), async (req, res) => {
-  const addressError = validateDeliveryAddress(req.body?.delivery_address);
-  if (addressError) return res.status(400).json({ success: false, message: addressError });
-  const deliveryAddress = normalizeDeliveryAddress(req.body.delivery_address);
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const paintingResult = await client.query(
-      "SELECT id, price, status FROM public.paintings WHERE id = $1 FOR UPDATE",
-      [req.params.id]
-    );
-
-    if (paintingResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        success: false,
-        message: "Painting not found"
-      });
-    }
-
-    if (paintingResult.rows[0].status !== "available") {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        success: false,
-        message: "This painting is no longer available"
-      });
-    }
-
-    const orderResult = await client.query(
-      `INSERT INTO public.orders (user_id, painting_id, status, delivery_address, payment_method, total_amount)
-       VALUES ($1, $2, 'placed', $3::jsonb, 'cod', $4)
-       RETURNING id, user_id, painting_id, status, created_at, delivery_address, payment_method, total_amount`,
-      [req.user.id, req.params.id, JSON.stringify(deliveryAddress), paintingResult.rows[0].price]
-    );
-
-    await client.query(
-      "UPDATE public.paintings SET status = 'sold' WHERE id = $1",
-      [req.params.id]
-    );
-
-    await client.query("COMMIT");
-
-    res.status(201).json({
-      success: true,
-      message: "Painting purchased successfully",
-      order: orderResult.rows[0]
-    });
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("Purchase failed:", error);
-    res.setHeader("X-Debug-Error", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Could not complete purchase"
-    });
-  } finally {
-    client.release();
-  }
+  return res.status(409).json({ success: false, message: "Direct artwork purchases are no longer available. Submit an artwork request and add it to your bag after Studio approval." });
 });
 
 /**
@@ -560,9 +863,9 @@ app.post("/api/paintings/:id/purchase", authenticateToken, requireRole("customer
  * Customer cancels their own placed order and painting returns to available.
  */
 app.post("/api/orders/:id/cancel", authenticateToken, requireRole("customer"), async (req, res) => {
-  const client = await pool.connect();
-
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     const orderResult = await client.query(
@@ -596,13 +899,53 @@ app.post("/api/orders/:id/cancel", authenticateToken, requireRole("customer"), a
       [order.id]
     );
 
-    const checkoutPaintings = order.painting_id
-      ? [order.painting_id]
-      : (await client.query("SELECT painting_id FROM public.order_items WHERE order_id = $1 AND item_type = 'painting'", [order.id])).rows.map((row) => row.painting_id);
-    for (const paintingId of checkoutPaintings) {
-      await client.query("UPDATE public.paintings SET status = 'available' WHERE id = $1", [paintingId]);
-    }
-    if (!order.painting_id) {
+    if (order.painting_id) {
+      const itemTable = await client.query("SELECT to_regclass('public.order_items') IS NOT NULL AS present");
+      const mixedOrderCheck = itemTable.rows[0].present
+        ? "OR EXISTS (SELECT 1 FROM public.order_items oi WHERE oi.order_id = o.id AND oi.painting_id = p.id)"
+        : "";
+      await client.query(
+        `UPDATE public.paintings p SET status = 'available'
+         WHERE p.id = $1 AND NOT EXISTS (
+           SELECT 1 FROM public.orders o
+           WHERE o.id <> $2 AND o.status = 'placed'
+             AND (o.painting_id = p.id ${mixedOrderCheck})
+         )`,
+        [order.painting_id, order.id]
+      );
+    } else {
+      const lines = await client.query(
+        "SELECT id, painting_id, item_type FROM public.order_items WHERE order_id = $1 FOR UPDATE",
+        [order.id]
+      );
+      for (const line of lines.rows) {
+        if (line.type === "painting" || line.item_type === "painting") {
+          await client.query(
+            `UPDATE public.paintings p SET status = 'available'
+             WHERE p.id = $1 AND NOT EXISTS (
+               SELECT 1 FROM public.orders o
+               WHERE o.id <> $2 AND o.status = 'placed'
+                 AND (o.painting_id = p.id OR EXISTS (
+                   SELECT 1 FROM public.order_items other_line
+                   WHERE other_line.order_id = o.id AND other_line.painting_id = p.id
+                 ))
+             )`,
+            [line.painting_id, order.id]
+          );
+          await client.query(
+            `UPDATE public.painting_requests
+             SET status = 'approved', order_item_id = NULL
+             WHERE order_item_id = $1 AND status = 'purchased'`,
+            [line.id]
+          );
+        }
+        if (line.item_type === "mural") {
+          await client.query("UPDATE public.wall_bookings SET order_item_id = NULL WHERE order_item_id = $1", [line.id]);
+        }
+        if (line.item_type === "pottery") {
+          await client.query("UPDATE public.pottery_requests SET order_item_id = NULL WHERE order_item_id = $1", [line.id]);
+        }
+      }
       await client.query("UPDATE public.order_items SET status = 'cancelled' WHERE order_id = $1", [order.id]);
     }
 
@@ -613,7 +956,7 @@ app.post("/api/orders/:id/cancel", authenticateToken, requireRole("customer"), a
       message: "Order cancelled and painting is available again"
     });
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    if (client) await client.query("ROLLBACK").catch(() => {});
     // PostgreSQL error 22P02 = invalid input syntax for UUID
     if (error.code === "22P02") {
       return res.status(404).json({ success: false, message: "Order not found" });
@@ -624,7 +967,7 @@ app.post("/api/orders/:id/cancel", authenticateToken, requireRole("customer"), a
       message: "Could not cancel order"
     });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
@@ -640,9 +983,10 @@ app.get("/api/orders/my", authenticateToken, requireRole("customer"), async (req
     res.json({ success: true, orders });
   } catch (error) {
     console.error("Could not fetch orders:", error.message);
-    res.status(500).json({
+    const setupMessage = workflowFailureMessage(error, "Order history");
+    res.status(setupMessage ? 503 : 500).json({
       success: false,
-      message: "Could not fetch your orders"
+      message: setupMessage || "Could not fetch your orders"
     });
   }
 });
@@ -731,9 +1075,9 @@ app.get("/api/wall-bookings/estimate", async (req, res) => {
  */
 app.post("/api/wall-bookings", authenticateToken, requireRole("customer"), async (req, res) => {
   const { booking_date, wall_size_sqft, address } = req.body;
-  const client = await pool.connect();
-
+  let client;
   try {
+    client = await pool.connect();
     // --- Input validation ---
     if (
       typeof booking_date !== "string" ||
@@ -798,7 +1142,7 @@ app.post("/api/wall-bookings", authenticateToken, requireRole("customer"), async
 
     res.status(201).json({ success: true, booking: result.rows[0] });
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
+    if (client) await client.query("ROLLBACK").catch(() => {});
 
     // Unique index violation → date already booked
     if (error.code === "23505") {
@@ -809,12 +1153,13 @@ app.post("/api/wall-bookings", authenticateToken, requireRole("customer"), async
     }
 
     console.error("Wall booking failed:", error.message);
-    res.status(500).json({
+    const setupMessage = workflowFailureMessage(error, "Mural requests");
+    res.status(setupMessage ? 503 : 500).json({
       success: false,
-      message: "Could not create wall booking"
+      message: setupMessage || "Could not create wall booking"
     });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
@@ -876,9 +1221,14 @@ app.patch("/api/wall-bookings/:id/cancel", authenticateToken, requireRole("custo
       });
     }
 
+    if (booking.order_item_id) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ success: false, message: "Cancel the checkout order before cancelling this mural booking" });
+    }
+
     // Cancellation window: must be ≥ 3 days before booking date
     const today      = todayIST();
-    const bookingDay = String(booking.booking_date).slice(0, 10);
+    const bookingDay = dateOnlyISO(booking.booking_date);
     const daysUntil  = daysBetween(today, bookingDay);
 
     if (daysUntil < 3) {
@@ -1042,6 +1392,31 @@ app.get("/api/pottery-requests/my", authenticateToken, requireRole("customer"), 
       success: false,
       message: "Could not fetch your pottery requests"
     });
+  }
+});
+
+app.post("/api/pottery-requests/:id/cart-eligibility", authenticateToken, requireRole("customer"), async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT pr.*, pi.name AS item_name, g.name AS glaze_name
+       FROM public.pottery_requests pr
+       JOIN public.pottery_items pi ON pi.id = pr.item_id
+       JOIN public.glazes g ON g.id = pr.glaze_id
+       WHERE pr.id = $1 AND pr.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Pottery request not found" });
+    const request = result.rows[0];
+    if (request.status !== "accepted" || request.order_item_id) {
+      return res.status(409).json({ success: false, message: "Only accepted pottery requests that are not already ordered can be added to the bag" });
+    }
+    const estimate = potteryEstimate(request.item_name, request.quantity);
+    if (!estimate) return res.status(409).json({ success: false, message: "This pottery request has no configured price" });
+    res.json({ success: true, request: { ...request, ...estimate } });
+  } catch (error) {
+    if (error.code === "22P02") return res.status(404).json({ success: false, message: "Pottery request not found" });
+    console.error("Pottery cart eligibility check failed:", error.message);
+    res.status(500).json({ success: false, message: "Could not verify pottery request" });
   }
 });
 
@@ -1213,9 +1588,10 @@ app.get("/api/admin/orders", authenticateToken, requireRole("studio"), async (re
     res.json({ success: true, orders });
   } catch (error) {
     console.error("Could not fetch admin orders:", error.message);
-    res.status(500).json({
+    const setupMessage = workflowFailureMessage(error, "Studio orders");
+    res.status(setupMessage ? 503 : 500).json({
       success: false,
-      message: "Could not fetch orders"
+      message: setupMessage || "Could not fetch orders"
     });
   }
 });
@@ -1261,6 +1637,17 @@ app.patch("/api/admin/wall-bookings/:id", authenticateToken, requireRole("studio
   }
 
   try {
+    if (status === "confirmed") {
+      const candidate = await pool.query(
+        "SELECT booking_date FROM public.wall_bookings WHERE id = $1 AND status = 'requested'",
+        [req.params.id]
+      );
+      if (!candidate.rows.length) return res.status(404).json({ success: false, message: "Pending booking not found" });
+      const date = dateOnlyISO(candidate.rows[0].booking_date);
+      if (!isValidISODate(date) || date < addDays(todayIST(), 7) || date > addDays(todayIST(), 90)) {
+        return res.status(409).json({ success: false, message: "This booking date is no longer within the 7–90 day window" });
+      }
+    }
     const result = await pool.query(
       `UPDATE public.wall_bookings
        SET status = $1
@@ -1278,6 +1665,8 @@ app.patch("/api/admin/wall-bookings/:id", authenticateToken, requireRole("studio
 
     res.json({ success: true, booking: result.rows[0] });
   } catch (error) {
+    if (error.code === "23505") return res.status(409).json({ success: false, message: "That date already has a pending or confirmed mural request" });
+    if (error.code === "22P02") return res.status(404).json({ success: false, message: "Booking not found" });
     console.error("Admin booking update failed:", error.message);
     res.status(500).json({
       success: false,
@@ -1356,6 +1745,13 @@ app.patch("/api/admin/pottery-requests/:id", authenticateToken, requireRole("stu
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+const server = app.listen(PORT);
+server.once("listening", () => {
   console.log(`Backend running at http://localhost:${PORT}`);
+});
+server.once("error", (error) => {
+  // Express 5 passes listen errors to an app.listen callback. Listen for the
+  // event explicitly so a failed bind cannot be reported as a successful start.
+  console.error(`Backend could not listen on port ${PORT}: ${error.code || error.message}`);
+  process.exitCode = 1;
 });

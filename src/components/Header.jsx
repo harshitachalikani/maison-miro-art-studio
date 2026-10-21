@@ -22,7 +22,7 @@ export default function Header() {
   return (
     <header className="site-header">
       <div className="header-inner">
-        <Link to="/" className="logo" onClick={() => setMenuOpen(false)}>
+        <Link to="/home" className="logo" onClick={() => setMenuOpen(false)}>
           <span className="logo-main">MAISON MIRO</span>
           <span className="logo-tag">Art for the spaces we call home.</span>
         </Link>
@@ -38,6 +38,7 @@ export default function Header() {
 
         <nav className={`site-nav${menuOpen ? " site-nav--open" : ""}`} aria-label="Main navigation">
           <NavLink to="/collection" className={navLinkClass} onClick={() => setMenuOpen(false)}>Collection</NavLink>
+          {user?.role === "studio" && <NavLink to="/studio/catalogue" className={navLinkClass} onClick={() => setMenuOpen(false)}>Artwork Catalogue</NavLink>}
           <NavLink to="/wall-murals" className={navLinkClass} onClick={() => setMenuOpen(false)}>Wall Murals</NavLink>
           <NavLink to="/pottery" className={navLinkClass} onClick={() => setMenuOpen(false)}>Pottery</NavLink>
 
@@ -46,14 +47,17 @@ export default function Header() {
               {user.role === "studio" && (
                 <NavLink to="/studio" className={navLinkClass} onClick={() => setMenuOpen(false)}>Studio</NavLink>
               )}
-              <NavLink to="/account" className={navLinkClass} onClick={() => setMenuOpen(false)}>My Account</NavLink>
+              {user.role !== "studio" && <NavLink to="/account" className={navLinkClass} onClick={() => setMenuOpen(false)}>My Account</NavLink>}
               <button className="btn btn--ghost btn--sm" onClick={handleLogout}>Sign out</button>
             </>
           ) : (
-            <NavLink to="/login" className={navLinkClass} onClick={() => setMenuOpen(false)}>Sign in</NavLink>
+            <>
+              <NavLink to="/login" className={navLinkClass} onClick={() => setMenuOpen(false)}>Customer Sign In</NavLink>
+              <NavLink to="/admin-login" className={navLinkClass} onClick={() => setMenuOpen(false)}>Admin Sign In</NavLink>
+            </>
           )}
 
-          <Link
+          {user?.role !== "studio" && <Link
             to="/cart"
             className="cart-icon"
             aria-label={`Cart (${items.length} item${items.length !== 1 ? "s" : ""})`}
@@ -65,7 +69,7 @@ export default function Header() {
               <path d="M16 10a4 4 0 0 1-8 0"/>
             </svg>
             {items.length > 0 && <span className="cart-badge">{items.length}</span>}
-          </Link>
+          </Link>}
         </nav>
       </div>
     </header>
