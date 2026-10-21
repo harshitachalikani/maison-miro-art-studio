@@ -1,62 +1,27 @@
-# MAISON MIRO — Design, Architecture, and Assignment Notes
+# MAISON MIRO — Design and Assignment Notes
 
 ## Architecture
 
-The customer interface is React 19 with Vite 8. It calls an Express 5 API, which uses PostgreSQL through node-postgres. Authentication uses bcrypt password hashes and signed JWTs. The backend reads DATABASE_URL and JWT_SECRET from the server environment.
+The customer and Studio interfaces use React 19 with Vite 8. The Express 5 backend uses PostgreSQL through `pg`; `src/api.js` currently targets `http://localhost:3000`. Artwork images use paths under `public/images` or an image URL. There is no upload service.
 
-The API client currently targets http://localhost:3000. The frontend's painting collection, pottery catalogue, glazes, standalone mural booking, and standalone pottery request flows call API endpoints. The application also contains a mixed-cart checkout flow stored in browser localStorage; that flow is separate from the PostgreSQL-backed routes.
+## Assignment question 1: How do login and the two roles work?
 
-## Assignment question 1: How are login and roles handled?
+Customer registration calls the backend, which hashes the password with bcrypt and assigns the `customer` role; a submitted role is not trusted. Login returns a signed JWT, stored in browser `sessionStorage` and checked against `/api/auth/me`. Studio accounts are created through the private `server/create-studio-account.js` script, not public registration. Backend middleware protects Studio endpoints: missing/invalid tokens receive 401 and an authenticated user with the wrong role receives 403.
 
-Customers register through the public registration endpoint. The server hashes passwords with bcrypt and assigns the customer role itself, ignoring any role supplied by the client. Login verifies the password hash and returns a signed token. The frontend stores the token in sessionStorage and checks it through the authenticated current-user endpoint after reload.
+## Assignment question 2: Which database is used and why?
 
-Studio accounts are not created through public registration. The server-side setup script prompts for the email and password and inserts a studio-role account into the configured database. It should only be run after checking that the database target is correct.
+The backend uses PostgreSQL and accepts a Supabase PostgreSQL connection through `DATABASE_URL`. Relational tables, foreign keys, transactions, and row locks support shared accounts, artwork, requests, bookings, and orders. The repository does not create the base schema or seed the database; `seedData/seed.json` is reference data, not a seeding script. The live schema and migration state have not been verified by this repository check.
 
-Protected API routes enforce access on the server: missing or invalid tokens receive 401, and a valid token with the wrong role receives 403. Customer data routes scope database queries to the token's user ID. Studio administration endpoints require the studio role. Client-side route guards improve navigation but are not the authorization boundary.
+## Assignment question 3: How are duplicate paintings and mural dates prevented?
 
-## Assignment question 2: Which database is used?
+Artwork requests and purchases are checked on the server, with row locks around approval/checkout and a partial unique index preventing more than one approved request per painting when migration 002 is installed. Checkout validates availability and records the order and inventory change in a database transaction. Mural dates are checked against the 7–90 day policy, while a partial unique index limits active requested/confirmed bookings to one per date; migration 002 replaces that index. These database safeguards depend on compatible tables, successful migrations, and a reachable database, so their live enforcement must be verified before claiming production protection.
 
-The backend is configured for PostgreSQL and supports a Supabase PostgreSQL connection through DATABASE_URL. PostgreSQL is the persistent store for accounts, painting records, standalone painting orders, mural bookings, and pottery requests, when the required schema exists and the database is reachable.
+## Assignment question 4: What is complete, what is incomplete, and what comes next?
 
-The repository does not provide a verified provisioning or seed process. The JSON file in seedData is reference/catalogue data, not a database seeding script. Database contents and schema must be checked separately; this document does not claim that a live Supabase project was queried.
+The code includes customer and Studio sign-in, role-protected request management, artwork creation/editing, customer painting requests and approval, mural bookings, pottery requests, and a mixed COD checkout with server-side price and availability checks. New checkout orders and their items are intended to persist in PostgreSQL and appear in Studio orders; older browser-local orders may remain in customer history but are not shared with Studio. The direct painting purchase route is disabled, so paintings use the request-and-approval flow.
 
-## Assignment question 3: How are duplicate painting purchases and date bookings prevented?
-
-For database-backed painting purchase, the backend checks that a painting is available while holding a PostgreSQL row lock, then inserts the order and updates painting availability in one transaction. The design has documented a partial unique index as an additional database guard, but this repository does not include a migration that creates that painting index. Its existence in a particular database must be verified.
-
-For database-backed wall bookings, the server validates the requested date and catches PostgreSQL unique-constraint conflicts. The design documents a partial unique index for active bookings on a date, but this repository does not include verified provisioning for that index. Do not assume the live database enforces date uniqueness until its schema is checked.
-
-The mixed-cart checkout route has a checkout-key idempotency mechanism and transactional price/inventory handling in server code. It relies on columns and an order_items table added by server/migrations/001_unified_checkout.sql. That migration is not documented as applied and was not run for this submission preparation.
-
-The current customer mixed-cart checkout in the frontend does not call that route. It writes one checkout record per bag into browser localStorage and prevents a repeated submit within the current page interaction. Local orders are not shared, cannot protect global inventory, and are not visible in the studio admin database screens. A locally recorded painting can appear Sold in that browser; this is not database inventory.
-
-## Assignment question 4: What is complete, what is limited, and what comes next?
-
-### Implemented in the current code
-
-- Customer registration, login, logout, token verification, and server-side role checks.
-- Database-backed painting, pottery catalogue, and glaze reads.
-- Database-backed standalone painting purchase and cancellation routes with transactional availability changes.
-- Database-backed mural booking, estimate, customer history/cancellation, and studio confirm/decline endpoints.
-- Database-backed pottery request, customer history/edit/cancel, and studio accept/decline endpoints.
-- A mixed-cart interface with COD, delivery details, one local order per checkout, item detail, and whole-order local cancellation.
-- Loading, empty, and error feedback on the main customer collection, artwork, request, checkout, and order screens.
-
-### Important limitations and unverified items
-
-- Mixed-cart checkout records are browser-local. They are not PostgreSQL orders, are not visible to studio staff, and do not synchronize across devices.
-- The backend unified checkout requires the unapplied migration in server/migrations/001_unified_checkout.sql. Do not treat it as operational against a database that has not been checked for those columns and table.
-- The project has no checked-in automated test suite. The backend npm test script is a placeholder. No live database or end-to-end workflows were tested for this document.
-- The README and seed JSON do not provision or seed a database. Database schema, seed data, and documented unique indexes must be verified independently.
-- The application frontend uses a fixed localhost API URL. Production hosting requires a deliberate API URL and deployment configuration update.
-
-### Recommended next steps
-
-1. Confirm the target PostgreSQL schema and indexes using read-only inspection before deciding whether any schema work is needed.
-2. Choose whether checkout should remain explicitly local-only or be moved to the backend after a reviewed, compatible schema update.
-3. Add repeatable, non-production tests for authentication, authorization, purchases/cancellation, bookings, pottery requests, and checkout.
-4. Update deployment configuration and documentation after verifying the actual database setup.
+The repository has no base-schema provisioning or database seed command, no image-upload service, and no automated test suite; the backend `npm test` script is a placeholder. The frontend API URL is fixed to localhost, and this review did not verify a live database connection, migration state, or end-to-end persistence. Next, verify the intended database and backup, confirm the existing tables and migrations, then run the workflows against a non-production test account/database before deployment. Configure a production API URL and hosting only when deployment is planned.
 
 ## Environment variables
 
-The backend requires DATABASE_URL and JWT_SECRET. Placeholder values are provided in server/.env.example. Keep actual values only in the ignored server/.env file or a secret manager. The frontend currently defines no Vite environment variables.
+The backend requires `DATABASE_URL` and `JWT_SECRET`, documented with placeholder values in `server/.env.example`. The frontend currently uses no Vite environment variables. Keep real values in the ignored `server/.env` file or a secret manager; never commit them.
